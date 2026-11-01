@@ -19,6 +19,7 @@ import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport,
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
+import { createApiClient } from './wb-client.js';
 import { discoverDshBaseUrl } from './dsh-endpoint.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
@@ -27,6 +28,7 @@ import { compactModelMessage, describeAge, sanitizeUntrustedText } from './qq-mo
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { normalizeImageForModel } from './media-normalize.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
+import { normalizeTtsConfig, synthesizeSpeech, listTtsVoices } from './tts.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -581,9 +583,9 @@ let modelCatalogInFlight = null;
 // 控制台改强度后递增它，让已在运行的会话在下一条消息重新 selectModel；
 // 放在模块级是为了不依赖 main() 内部声明的执行顺序（避免 TDZ）。
 let modelSelectionEpoch = 0;
-// DeepSeek provider 明确支持的取值（见 dsh-llm-deepseek：其它值会抛 UNSUPPORTED_REASONING_EFFORT）。
-// 'off' 虽然合法（关闭思考），但 QQ 聊天助手依赖思考，控制台不提供该档。
-const REASONING_EFFORT_OPTIONS = ['low', 'high', 'max'];
+// 允许的思考强度取值。WorkBuddy 后端（CodeBuddy CLI）支持 off/low/medium/high/xhigh/max；
+// 这里取 DSH 与 WorkBuddy 都认的四个档位（off = 关闭思考，低延迟低消耗）。
+const REASONING_EFFORT_OPTIONS = ['off', 'low', 'high', 'max'];
 const REASONING_EFFORT_DEFAULT = 'max';
 function normalizeReasoningEffort(value) {
   const v = String(value ?? '').trim().toLowerCase();
@@ -718,6 +720,10 @@ function loadConfig() {
       autoDiscoverPort: true,
       ...(file.dsh ?? {})
     },
+    // agent 后端：dsh（默认）或 workbuddy（本机 WorkBuddy CLI headless，见 src/wb-client.js）
+    backend: String(file.backend ?? 'dsh').toLowerCase(),
+    // WorkBuddy 后端的配置段（cliPath/homeDir/model/permissionMode 等）
+    workbuddy: { ...(file.workbuddy ?? {}) },
     snowluma: { wsUrl: 'ws://127.0.0.1:3001', accessToken: '', ...(file.snowluma ?? {}) },
     // 空 => 每个会话在 state/agents/<key> 下建独立工作目录
     sessionCwd: file.sessionCwd ?? '',
@@ -1309,7 +1315,9 @@ async function segmentsToText(segments, options = {}) {
       // 市场表情（mface）在部分网关实现里出现：有 summary 就用它，别让模型只看到 "[mface]"。
       case 'mface': out.push(`[表情${d.summary ? `:${d.summary}` : ''}]`); break;
       case 'image': out.push('[图片]'); break;
-      case 'record': out.push('[语音]'); break;
+      // 有的网关/协议实现会在 record 段带 QQ 的语音转写（data.text）。
+      // 有就直接给模型看，没有才退回纯标记——否则模型只知道「有人发了语音」。
+      case 'record': out.push(d.text ? `[语音：${String(d.text).slice(0, 300)}]` : '[语音]'); break;
       case 'video': out.push('[视频]'); break;
       case 'file': out.push(`[文件${d.name ?? ''}]`); break;
       case 'reply': {
@@ -1603,7 +1611,7 @@ async function main() {
       // 本地没有时，尝试强制刷新一次再找（收藏可能在会话过程中新增）
       const forced = await syncStickerLibrary(true);
       const entry2 = findSticker(forced?.entries ?? stickerEntries, stickerId);
-      if (!entry2) throw new Error(`找不到表情 ${stickerId}，请先用 qq_list_stickers 获取有效 id`);
+      if (!entry2) throw new Error(`找不到表情「${stickerId}」：可传完整 id/md5/url、唤醒提示里 # 开头的短 id，或它的备注/标签（需唯一）；不确定就先调 qq_list_stickers`);
       return entry2;
     }
     return entry;
@@ -1638,6 +1646,9 @@ async function main() {
 
   function voiceCfg() {
     const v = cfg.socialV2?.voice ?? {};
+    // ffprobe 只用于探测时长/编码，inspectAudio 的默认参数读这个环境变量；
+    // 这里做一次性注入（幂等），避免每个调用点都改签名。
+    if (!process.env.FFPROBE_PATH && v.ffprobePath) process.env.FFPROBE_PATH = String(v.ffprobePath);
     return {
       enabled: v.enabled !== false,
       dir: path.resolve(ROOT, String(v.dir ?? 'audio')),
@@ -1649,7 +1660,10 @@ async function main() {
       defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
       loudness: v.loudness || 'normal',
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
-      autoReadback: v.autoReadback !== false
+      // ffprobe 只用于探测时长/编码；缺省时 inspectAudio 会降级（不校验时长），不影响发送。
+      ffprobePath: process.env.FFPROBE_PATH || v.ffprobePath || null,
+      autoReadback: v.autoReadback !== false,
+      tts: normalizeTtsConfig(v.tts)
     };
   }
 
@@ -2004,7 +2018,7 @@ async function main() {
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
     const entry = findSticker(synced?.entries ?? stickerEntries, stickerRef);
-    if (!entry) throw new Error(`找不到表情 ${stickerRef}，请先用 qq_list_stickers 获取有效 id`);
+    if (!entry) throw new Error(`找不到表情「${stickerRef}」：可传完整 id/md5/url、唤醒提示里 # 开头的短 id，或它的备注/标签（需唯一）；不确定就先调 qq_list_stickers`);
     const url = entry.url;
     if (!url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
     const [kind, id] = key.split(':');
@@ -2205,8 +2219,17 @@ async function main() {
       slangLearnerSessionId = String(saved.sessionId);
       learnerSessions.add(slangLearnerSessionId);
       api.events.follow(slangLearnerSessionId);
-      await ensureChatModel(slangLearnerSessionId);
-      return slangLearnerSessionId;
+      const applied = await ensureChatModel(slangLearnerSessionId);
+      // 与 ensureSession 同一套兜底：会话在 agent 侧被销毁（DSH 重启 / WorkBuddy CLI 进程退出后
+      // 旧 id 不再存在）时，state/slang-session.json 里的 id 就是死的。不在这里丢弃重建的话，
+      // 每次黑话提取都会拿死 id 去 prompt，被 session/not-found 拒掉后直接 return ——
+      // 表现是「黑话学习永久停摆」，而且日志里每 5 分钟刷一条 not-found。
+      if (applied === 'not-found') {
+        log(`黑话学习会话 ${slangLearnerSessionId} 已不存在，丢弃本地记录并重建`);
+        invalidateSlangLearnerSession();
+      } else {
+        return slangLearnerSessionId;
+      }
     }
     const dir = path.join(STATE_DIR, 'slang-agent');
     fs.mkdirSync(dir, { recursive: true });
@@ -2492,16 +2515,12 @@ async function main() {
     log('ℹ️  socialV2.voice.allowAbsolutePath=true 已不再放宽 AI 通道：AI 发的语音始终只允许来自语音库（库外文件请用语音工具/CLI 发送）');
   }
 
-  // DSH 侧
-  const api = new NodeApiClient(cfg.dsh.baseUrl, undefined, {
-    token: cfg.dsh.authToken,
-    // true=用户在 config.json 里显式填的；false=从日志猜的。猜来的不优先于离线铸造。
-    tokenExplicit: cfg.dsh.authTokenExplicit === true,
-    header: cfg.dsh.authHeader,
-    prefix: cfg.dsh.authPrefix,
-    // 默认只允许把 launch token 交给回环地址；远程 DSH 需要显式 opt-in（见 dsh-client.ensureAuth）。
-    allowRemote: cfg.dsh.allowRemote === true
-  });
+  // agent 后端：'dsh'（DeepSeek Harness Web API）或 'workbuddy'（CodeBuddy CLI headless）。
+  // 两者对外暴露同一套接口面（见 src/wb-client.js 顶部说明），QQ 侧逻辑与后端无关。
+  const backend = String(cfg.backend ?? 'dsh').toLowerCase();
+  log('agent 后端：' + (backend === 'workbuddy' ? 'WorkBuddy（CLI headless）' : 'DSH（' + cfg.dsh.baseUrl + '）'));
+  const api = await createApiClient(cfg, { log });
+  void backend;
   // DSH 的模型目录 RPC：0.1.5 是 `session/modelCatalog`。**不能走基类门面**
   // `api.sessions.modelCatalog` —— 桥接钉住的 `@deepseek-ai/dsh-host-apiproxy@0.1.1-rc.2`
   // 的 sessions 门面里根本没有这个方法（只有 `models` → 已下线的 `session/models`），
@@ -5947,6 +5966,160 @@ async function main() {
           return;
         }
 
+        // 操作者通道：控制台试听 / 换音色。AI 通道（speak）需要会话令牌，这里凭控制台令牌即可。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/tts-preview') {
+          const body = await readBody();
+          const voice = voiceCfg();
+          const tts = voice.tts;
+          if (!tts.enabled) { sendJson({ ok: false, error: '语音合成未启用（socialV2.voice.tts.enabled=false）' }, 403); return; }
+          const text = mdToPlain(String(body.text ?? '')).replace(/\s+/g, ' ').trim();
+          if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+          if (text.length > tts.maxChars) { sendJson({ ok: false, error: `text 太长（${text.length} > ${tts.maxChars} 字）` }, 400); return; }
+          // 控制台在「还没保存」时也能试听：body.tts 只覆盖本次调用，不落盘。
+          // （字段走 normalizeTtsConfig 二次校验，非法值会被归一化或拒绝。）
+          const ov = (body.tts && typeof body.tts === 'object' && !Array.isArray(body.tts)) ? body.tts : null;
+          const ttsCfg = ov
+            ? {
+              ...tts,
+              ...(ov.engine !== undefined ? { engine: ov.engine } : {}),
+              ...(ov.voice !== undefined ? { voice: ov.voice } : {}),
+              ...(ov.rate !== undefined ? { rate: ov.rate } : {}),
+              ...(ov.pitch !== undefined ? { pitch: ov.pitch } : {}),
+              http: { ...tts.http, ...(ov.http && typeof ov.http === 'object' && !Array.isArray(ov.http) ? ov.http : {}) },
+              command: { ...tts.command, ...(ov.command && typeof ov.command === 'object' && !Array.isArray(ov.command) ? ov.command : {}) }
+            }
+            : tts;
+          try {
+            const synth = await synthesizeSpeech({
+              text,
+              root: ROOT,
+              cfg: ttsCfg,
+              outDir: path.join(voice.dir, tts.dir),
+              overrides: { voice: body.voice, rate: body.rate, pitch: body.pitch, volume: body.volume },
+              log
+            });
+            const rel = path.relative(voice.dir, synth.file).split(path.sep).join('/');
+            sendJson({
+              ok: true,
+              file: rel,
+              mimeType: synth.file.toLowerCase().endsWith('.wav') ? 'audio/wav' : 'audio/mpeg',
+              base64: fs.readFileSync(synth.file).toString('base64'),
+              text,
+              tts: { engine: synth.engine, voice: synth.voice, rate: synth.rate, pitch: synth.pitch, chars: synth.chars, cached: synth.cached, ms: synth.ms }
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `语音合成失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/tts-voices') {
+          const tts = voiceCfg().tts;
+          const voices = await listTtsVoices({ root: ROOT, cfg: tts });
+          sendJson({
+            ok: true,
+            current: tts.voice,
+            rate: tts.rate,
+            pitch: tts.pitch,
+            maxChars: tts.maxChars,
+            enabled: tts.enabled,
+            engine: tts.engine,
+            // 整段回传：控制台据此回填引擎/HTTP/命令行的配置项（保存时必须整段回写）。
+            tts,
+            voices: voices.filter((v) => v.zh).map((v) => v.name)
+          });
+          return;
+        }
+
+        // 文本 → TTS → 语音条：qq_speak 的后端。与 send-voice 共用同一套边界
+        // （语音库目录、额度、审计、静默模式），只是音频由这里现场合成。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/speak') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? body.target ?? '').trim();
+          const voice = voiceCfg();
+          const tts = voice.tts;
+          if (!voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭（socialV2.voice.enabled=false）' }, 403); return; }
+          if (!tts.enabled) { sendJson({ ok: false, error: '语音合成未启用（socialV2.voice.tts.enabled=false）' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_speak' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind2 = keyMatch[1];
+          const id2 = Number(keyMatch[2]);
+          if (!Number.isFinite(id2) || id2 <= 0 || !modeAllowed(key, kind2, id2, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+
+          // 去掉 markdown 标记：TTS 会把 `**加粗**`、列表符号、链接原样念出来。
+          const text = mdToPlain(String(body.text ?? '')).replace(/\s+/g, ' ').trim();
+          if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+          if (text.length > tts.maxChars) {
+            sendJson({ ok: false, error: `text 太长（${text.length} 字 > 上限 ${tts.maxChars} 字），语音只适合一两句短话` }, 400);
+            return;
+          }
+          if (SENSITIVE_RE.test(text)) {
+            appendActivity(`${key} [voice] 合成请求被拦截（文本疑似含敏感信息）`);
+            sendJson({ ok: false, error: '文本疑似包含密钥/令牌，拒绝合成外发' }, 400);
+            return;
+          }
+
+          const outDir = path.join(voice.dir, tts.dir);
+          let synth;
+          try {
+            synth = await synthesizeSpeech({
+              text,
+              root: ROOT,
+              cfg: tts,
+              outDir,
+              overrides: { voice: body.voice, rate: body.rate, pitch: body.pitch, volume: body.volume },
+              log
+            });
+          } catch (error) {
+            appendActivity(`${key} [voice] 语音合成失败：${error?.message ?? error}`);
+            sendJson({ ok: false, error: `语音合成失败：${error?.message ?? error}` }, 500);
+            return;
+          }
+
+          // 只把相对语音库的路径交给发送层：合成文件必然落在 audio/ 之内，
+          // 这样 sendVoiceForV2 的 safeJoinLibrary 校验依然成立。
+          const rel = path.relative(voice.dir, synth.file).split(path.sep).join('/');
+          const ttsInfo = { engine: synth.engine, voice: synth.voice, rate: synth.rate, pitch: synth.pitch, chars: synth.chars, cached: synth.cached, ms: synth.ms };
+
+          if (body.dryRun === true) {
+            sendJson({ ok: true, dryRun: true, key, file: rel, text, tts: ttsInfo });
+            return;
+          }
+
+          try {
+            const sent = await sendVoiceForV2(key, rel, {
+              label: (body.label ? String(body.label).slice(0, 100) : text.slice(0, 100)),
+              verify: body.verify,
+              readback: false
+            });
+            sendJson({
+              ok: true,
+              key,
+              messageId: sent.messageId,
+              file: rel,
+              text,
+              tts: ttsInfo,
+              detail: sent.detail,
+              verified: sent.verification?.confirmed === true,
+              warnings: sent.warnings
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-sticker') {
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const body = await readBody();
@@ -8405,9 +8578,18 @@ async function main() {
   // 本地映射已失效，调用方必须退役重建，否则每条消息都会对着一个不存在的会话重试。
   async function ensureChatModel(sessionId) {
     if (modelAppliedSessions.get(sessionId) === modelSelectionEpoch) return 'applied';
-    const provider = String(cfg.dsh?.provider || 'deepseek-official');
-    const model = String(cfg.dsh?.model || 'deepseek-flash');
-    const effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+    // 模型/思考强度的来源按后端区分（WorkBuddy 扩展）：workbuddy 用 cfg.workbuddy.*，dsh 用 cfg.dsh.*。
+    // 写死 cfg.dsh.* 会导致切到 WorkBuddy 后 config.workbuddy.model 不生效。
+    const workbuddyBackend = String(cfg.backend ?? 'dsh').toLowerCase() === 'workbuddy';
+    const provider = workbuddyBackend ? 'workbuddy' : String(cfg.dsh?.provider || 'deepseek-official');
+    const model = workbuddyBackend
+      ? String(cfg.workbuddy?.model || cfg.dsh?.model || 'deepseek-v4.1-flash')
+      : String(cfg.dsh?.model || 'deepseek-flash');
+    const rawEffort = workbuddyBackend
+      ? String(cfg.workbuddy?.reasoningEffort ?? '')
+      : String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+    // WorkBuddy 后端留空 = 不传 --effort（用 CLI 默认）。
+    const effort = workbuddyBackend && rawEffort === '' ? undefined : (rawEffort || REASONING_EFFORT_DEFAULT);
     let lastError = null;
     // 两段式降级（P1，repo-auditor 提的「effort 不对就 100% 哑掉」）：
     //   第 1 段按配置带 reasoningEffort；
@@ -8455,7 +8637,12 @@ async function main() {
     // 升级兼容：旧版本建的会话 id 由 DSH 自生成（session-…），解不出 QQ 会话 key，
     // 新的执行期闸门会把这类会话的全部带 key 工具调用拒掉（表现为「机器人突然不能用
     // 任何 QQ 工具」）。这里一次性退役重建；历史仍留在 DSH 里，不会丢。
-    if (existing && !BOUND_SESSION_ID_RE.test(String(existing))) {
+    // WorkBuddy 后端的会话 id 由 wb-client 自己生成（`wb-<uuid>`），不参与 DSH 的执行期绑定：
+    // 它没有 DSH 那套「用 qqb-<g|p>-<id> 解回会话身份」的工具闸门，MCP 工具靠 agentToken 鉴权。
+    // 若不跳过这条校验，每个 wb- 会话都会被判成「旧版遗留」并立即退役 —— 表现为每条消息都
+    // 重建一次会话：上下文全丢、每轮多付一次 CLI 冷启动与整张角色卡。
+    const idBindingRequired = String(cfg.backend ?? 'dsh').toLowerCase() !== 'workbuddy';
+    if (existing && idBindingRequired && !BOUND_SESSION_ID_RE.test(String(existing))) {
       log(`会话 ${key} 的 id 不是执行期绑定形态（${existing}），退役并按新规则重建`);
       retireSession(key);
       existing = state.sessions[key];
@@ -10836,6 +11023,11 @@ async function main() {
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8, key)}\n\n`
       : '';
+    // 只有语音合成真正可用时才教它用（否则等于给它一个必然报错的工具）。
+    const voiceCfgV2 = voiceCfg();
+    const voiceLine = voiceCfgV2.enabled && voiceCfgV2.tts.enabled
+      ? '【语音】你偶尔可以把一句话「说出来」而不是打字：qq_speak(text) 会现场合成语音条，语气比文字更像真人（晚安、撒娇、抱怨、突然认真）。text 必须是口语，不带 markdown、emoji、括号动作，一句 30 字内。语音是强表达，一次对话最多一条，对方没要求时别主动发；长内容、链接、需要精确核对的信息一律打字。\n\n'
+      : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const replyTiming = replyTimingV2(st);
@@ -10872,7 +11064,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + voiceLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;

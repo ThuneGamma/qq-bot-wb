@@ -1266,11 +1266,11 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
+    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的完整 id / md5 / url，也可以直接用唤醒提示里 # 开头的短 id，或该表情的备注/标签（需唯一匹配；不确定就先调 qq_list_stickers）。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      stickerId: z.string().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）'),
+      stickerId: z.string().describe('表情标识：qq_list_stickers 的完整 id/md5/url，或唤醒提示里 # 开头的短 id，或表情备注/标签（需唯一）'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
@@ -1366,6 +1366,34 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取语音库失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_speak',
+    '把一句话**现场合成成语音**发出去（文本 → TTS → 语音条）。和 qq_send_voice 的区别：那个只能发语音库里事先录好的固定音频，这个可以说什么就合成什么。什么时候用：① 一句话带明显语气/情绪，用语音比打字更像真人（晚安、撒娇、抱怨、突然认真）；② 对方明确要求「说句话/发语音/用语音回我」。什么时候别用：长段落、列表、代码、链接、需要精确核对的内容（TTS 会把符号念出来）。text 要写成**口语**，不要带 markdown、表情符号、颜文字、括号动作；一句话最好 30 字内，上限以返回的错误提示为准。语音是强表达，别刷屏——同一个会话里连着发语音很吵，偶尔一条即可。返回 verified=true 才代表这条语音真的落地了，否则不要声称「我发了语音」。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      text: z.string().describe('要念出来的话，纯口语文本，不要 markdown/emoji/括号动作'),
+      voice: z.string().optional().describe('可选音色（默认用配置里的角色音色）；形如 zh-CN-XiaoyiNeural'),
+      rate: z.string().optional().describe('可选语速，形如 +10% / -10%（默认 +0%）'),
+      pitch: z.string().optional().describe('可选音调，形如 +20Hz / -10Hz（默认 +0Hz）'),
+      label: z.string().optional().describe('可选：写进会话记录的说明，缺省用 text 前 100 字'),
+      verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true）')
+    },
+    async ({ key, token, text, voice, rate, pitch, label, verify }) => {
+      try {
+        const data = await agentApi('/api/socialV2/speak', {
+          method: 'POST',
+          body: JSON.stringify({ key, text: String(text), voice, rate, pitch, label: label || '', verify: verify !== false, token }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 180000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送合成语音失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

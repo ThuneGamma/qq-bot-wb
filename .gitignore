@@ -66,3 +66,15 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# ── 本地语音推理环境（GPT-SoVITS 仓库 + venv + 权重，约 8 GB，绝不入库）───────
+/.gsv/
+
+# 第三方语音素材：体积大且无明确授权（提示音包 / 直播切片数据集 / 参考音频）
+/refs/
+
+# 本地二进制约 84 MB，不入库
+/tools/ffmpeg.exe
+
+# 打补丁前留下的临时备份
+/src/*.wb-backup-*
+

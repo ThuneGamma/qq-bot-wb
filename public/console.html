@@ -2073,6 +2073,81 @@ button:active:not(:disabled) {
         命令行等价工具：<code>node scripts/send-voice.mjs list-voice</code>（经桥接）或 <code>node voice-cli.mjs</code>（独立工具，在上级 <code>voice-tool/</code> 里直连 SnowLuma）。
       </div>
 
+      <hr style="margin:16px 0 12px;border:none;border-top:1px solid rgba(128,128,128,.25)">
+      <div class="meta" style="margin-bottom:8px">
+        <b>语音合成（TTS）</b>：把一句话现场合成语音条（<code>qq_speak</code> 的后端）。音色/语速改这里并「存为默认」后，AI 说话用同一套参数；
+        试听只合成、不发送，也不占发送额度。
+      </div>
+      <div class="row" style="gap:8px;align-items:flex-start">
+        <textarea id="ttsText" rows="2" placeholder="要念的话，纯口语，别带 markdown/emoji（例：晚上好喵，今天也辛苦啦喵）" style="flex:1;min-width:240px"></textarea>
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+        <label style="flex:0 0 auto">引擎</label>
+        <select id="ttsEngine" style="width:280px">
+          <option value="edge">edge-tts（微软预置音色，免部署）</option>
+          <option value="http">HTTP 服务（GPT-SoVITS / CosyVoice 等，可克隆音色）</option>
+          <option value="command">命令行（任意本地 TTS）</option>
+        </select>
+        <span class="meta">换引擎后先「试听」，满意再「存为默认」</span>
+      </div>
+
+      <div id="ttsEdgeBox" style="margin-top:8px">
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <label style="flex:0 0 auto">音色</label>
+          <select id="ttsVoice" style="width:220px"><option value="">加载中…</option></select>
+          <label style="flex:0 0 auto">语速</label>
+          <input type="text" id="ttsRate" style="width:76px" placeholder="+8%">
+          <label style="flex:0 0 auto">音调</label>
+          <input type="text" id="ttsPitch" style="width:76px" placeholder="+0Hz">
+        </div>
+      </div>
+
+      <div id="ttsHttpBox" style="display:none;margin-top:8px">
+        <div class="meta" style="margin-bottom:6px">
+          填本地 GPT-SoVITS 的 <code>api_v2.py</code> 地址（默认 <code>http://127.0.0.1:9880/tts</code>）。
+          参考音频是**服务端**能读到的绝对路径，5~10 秒、无背景音、只说一句话；<code>参考文字</code>必须和那段音频内容一致。
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <label style="flex:0 0 auto">服务地址</label>
+          <input type="text" id="ttsHttpUrl" placeholder="http://127.0.0.1:9880/tts" style="width:260px">
+          <label style="flex:0 0 auto">格式</label>
+          <select id="ttsHttpFormat" style="width:150px">
+            <option value="gpt-sovits">gpt-sovits</option>
+            <option value="openai">openai（/v1/audio/speech）</option>
+            <option value="raw">raw（自定义 JSON）</option>
+          </select>
+          <label style="flex:0 0 auto">参考音频</label>
+          <input type="text" id="ttsRefAudio" placeholder="D:/tts/refs/taffy.wav" style="width:260px">
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:6px">
+          <label style="flex:0 0 auto">参考文字</label>
+          <input type="text" id="ttsPromptText" placeholder="参考音频里说的那句话" style="flex:1;min-width:240px">
+          <label style="flex:0 0 auto">语言</label>
+          <input type="text" id="ttsTextLang" value="zh" style="width:60px">
+        </div>
+        <div class="row" style="margin-top:6px">
+          <label style="flex:0 0 auto">额外字段</label>
+          <input type="text" id="ttsExtraBody" placeholder='可选 JSON，如 {"speed_factor":1.0}' style="flex:1">
+        </div>
+      </div>
+
+      <div id="ttsCmdBox" style="display:none;margin-top:8px">
+        <div class="meta" style="margin-bottom:6px">可用占位符：<code>{text}</code> <code>{out}</code> <code>{voice}</code> <code>{rate}</code> <code>{pitch}</code>。输出文件路径会自动作为最后一个参数追加。</div>
+        <div class="row" style="gap:8px">
+          <input type="text" id="ttsCmdBin" placeholder="可执行文件，如 D:/tts/venv/Scripts/python.exe" style="flex:1">
+        </div>
+        <div class="row" style="gap:8px;margin-top:6px">
+          <input type="text" id="ttsCmdArgs" placeholder="参数，空格分隔，如 D:/tts/infer.py --text {text} --out {out}" style="flex:1">
+        </div>
+      </div>
+
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px">
+        <button id="ttsPreviewBtn" type="button" class="btn-secondary">试听</button>
+        <button id="ttsApplyBtn" type="button" class="btn-secondary">存为默认</button>
+        <span id="ttsMsg" class="meta"></span>
+      </div>
+      <audio id="ttsAudio" controls style="width:100%;margin-top:8px;display:none"></audio>
+
       </div></details>
 <details class="settings-group"><summary>唤醒推荐值（仅参考，AI 可不遵守）</summary><div class="settings-content">
       <div class="row">
@@ -3262,6 +3337,139 @@ async function sendVoiceFromConsole() {
   }
 }
 
+// ── 语音合成（TTS）：引擎切换 / 试听 / 存默认 ──────────────────────────────
+let ttsVoiceLoaded = false;
+
+function ttsToggleEngine() {
+  const e = document.getElementById('ttsEngine').value;
+  document.getElementById('ttsEdgeBox').style.display = e === 'edge' ? '' : 'none';
+  document.getElementById('ttsHttpBox').style.display = e === 'http' ? '' : 'none';
+  document.getElementById('ttsCmdBox').style.display = e === 'command' ? '' : 'none';
+}
+
+// 读出界面上「当前引擎」的完整配置（试听和保存共用）。
+function ttsCollectTts() {
+  const engine = document.getElementById('ttsEngine').value;
+  const out = { engine };
+  if (engine === 'edge') {
+    out.voice = document.getElementById('ttsVoice').value;
+    out.rate = document.getElementById('ttsRate').value.trim() || '+0%';
+    out.pitch = document.getElementById('ttsPitch').value.trim() || '+0Hz';
+  } else if (engine === 'http') {
+    const raw = document.getElementById('ttsExtraBody').value.trim();
+    let extra = {};
+    if (raw) {
+      try { extra = JSON.parse(raw); } catch { throw new Error('额外字段不是合法 JSON'); }
+    }
+    const lang = document.getElementById('ttsTextLang').value.trim() || 'zh';
+    out.http = {
+      url: document.getElementById('ttsHttpUrl').value.trim(),
+      format: document.getElementById('ttsHttpFormat').value,
+      refAudio: document.getElementById('ttsRefAudio').value.trim(),
+      promptText: document.getElementById('ttsPromptText').value.trim(),
+      textLang: lang,
+      promptLang: lang,
+      extraBody: extra
+    };
+  } else {
+    out.command = {
+      bin: document.getElementById('ttsCmdBin').value.trim(),
+      args: document.getElementById('ttsCmdArgs').value.trim().split(/\s+/).filter(Boolean)
+    };
+  }
+  return out;
+}
+
+async function loadTtsVoices(force) {
+  if (ttsVoiceLoaded && force !== true) return;
+  const sel = document.getElementById('ttsVoice');
+  const msg = document.getElementById('ttsMsg');
+  try {
+    const r = await api('/api/socialV2/tts-voices');
+    const t = r.tts || {};
+    document.getElementById('ttsEngine').value = t.engine || 'edge';
+    const list = Array.isArray(r.voices) ? r.voices : [];
+    if (list.length) {
+      // 音色名属于外部数据（来自 Python 子进程输出），一律 esc() 后插值。
+      sel.innerHTML = list.map((n) => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
+      if (r.current) sel.value = r.current;
+    } else {
+      sel.innerHTML = '<option value="">（当前引擎不用预置音色）</option>';
+    }
+    document.getElementById('ttsRate').value = r.rate || '+0%';
+    document.getElementById('ttsPitch').value = r.pitch || '+0Hz';
+    const h = t.http || {};
+    document.getElementById('ttsHttpUrl').value = h.url || '';
+    document.getElementById('ttsHttpFormat').value = h.format || 'gpt-sovits';
+    document.getElementById('ttsRefAudio').value = h.refAudio || '';
+    document.getElementById('ttsPromptText').value = h.promptText || '';
+    document.getElementById('ttsTextLang').value = h.textLang || 'zh';
+    document.getElementById('ttsExtraBody').value = (h.extraBody && Object.keys(h.extraBody).length) ? JSON.stringify(h.extraBody) : '';
+    const c = t.command || {};
+    document.getElementById('ttsCmdBin').value = c.bin || '';
+    document.getElementById('ttsCmdArgs').value = Array.isArray(c.args) ? c.args.join(' ') : '';
+    ttsToggleEngine();
+    ttsVoiceLoaded = true;
+    if (msg) { msg.textContent = ''; msg.className = 'meta'; }
+  } catch (error) {
+    msg.textContent = '加载 TTS 配置失败：' + (error && error.message ? error.message : error);
+    msg.className = 'meta err';
+  }
+}
+
+async function ttsPreview() {
+  const msg = document.getElementById('ttsMsg');
+  const audio = document.getElementById('ttsAudio');
+  const text = document.getElementById('ttsText').value.trim();
+  if (!text) { msg.textContent = '❌ 先写要念的话'; msg.className = 'meta err'; return; }
+  let tts;
+  try { tts = ttsCollectTts(); } catch (error) { msg.textContent = '❌ ' + error.message; msg.className = 'meta err'; return; }
+  if (tts.engine === 'edge' && !tts.voice) { msg.textContent = '❌ 音色列表还没加载出来'; msg.className = 'meta err'; return; }
+  if (tts.engine === 'http' && !tts.http.url) { msg.textContent = '❌ 先填 TTS 服务地址'; msg.className = 'meta err'; return; }
+  msg.textContent = '合成中…（本地模型首次加载可能要几十秒）'; msg.className = 'meta';
+  try {
+    const r = await api('/api/socialV2/tts-preview', 'POST', { text, tts });
+    if (!r.ok || !r.base64) { msg.textContent = '❌ ' + (r.error || '合成失败'); msg.className = 'meta err'; return; }
+    audio.src = 'data:' + (r.mimeType || 'audio/mpeg') + ';base64,' + r.base64;
+    audio.style.display = 'block';
+    audio.play().catch(() => {});
+    msg.textContent = '✅ ' + (r.tts && r.tts.cached ? '命中缓存' : '合成完成')
+      + '（' + (r.tts ? r.tts.engine : '?') + '，' + (r.tts ? r.tts.chars : '?') + ' 字，'
+      + (r.tts ? r.tts.ms : '?') + 'ms）→ ' + (r.file || '');
+    msg.className = 'meta ok';
+  } catch (error) {
+    msg.textContent = '❌ ' + (error && error.message ? error.message : error);
+    msg.className = 'meta err';
+  }
+}
+
+async function ttsApplyDefault() {
+  const msg = document.getElementById('ttsMsg');
+  let ov;
+  try { ov = ttsCollectTts(); } catch (error) { msg.textContent = '❌ ' + error.message; msg.className = 'meta err'; return; }
+  if (ov.engine === 'edge' && !ov.voice) { msg.textContent = '❌ 音色列表还没加载出来'; msg.className = 'meta err'; return; }
+  if (ov.engine === 'http' && !ov.http.url) { msg.textContent = '❌ 先填 TTS 服务地址'; msg.className = 'meta err'; return; }
+  try {
+    // 配置保存是浅合并：voice 必须整段回传，否则 ffmpegPath 等字段会被覆盖掉；
+    // http/command 也要和已有值合并（界面上只有一部分字段）。
+    const cur = await api('/api/socialV2/config');
+    const voiceCfg = { ...((cur.config || {}).voice || {}) };
+    const baseTts = voiceCfg.tts || {};
+    if (ov.http) ov.http = { ...(baseTts.http || {}), ...ov.http };
+    if (ov.command) ov.command = { ...(baseTts.command || {}), ...ov.command };
+    voiceCfg.tts = { ...baseTts, ...ov };
+    await api('/api/socialV2/config', 'POST', { voice: voiceCfg });
+    const label = ov.engine === 'edge' ? ov.voice : (ov.engine === 'http' ? ov.http.url : ov.command.bin);
+    msg.textContent = '✅ 已存为默认：' + ov.engine + ' → ' + label;
+    msg.className = 'meta ok';
+    ttsVoiceLoaded = false;
+    loadTtsVoices(true);
+  } catch (error) {
+    msg.textContent = '❌ ' + (error && error.message ? error.message : error);
+    msg.className = 'meta err';
+  }
+}
+
 // ── 二代仿真模式（reserved2）配置 ─────────────────────────────────────────
 async function loadV2Config() {
   try {
@@ -3842,6 +4050,9 @@ document.getElementById('v2ConfigSave').addEventListener('click', saveV2Config);
 document.getElementById('v2ConfigSaveTop').addEventListener('click', saveV2Config);
 document.getElementById('voiceRefreshBtn').addEventListener('click', () => loadVoiceLibrary(true));
 document.getElementById('voiceSendBtn').addEventListener('click', sendVoiceFromConsole);
+document.getElementById('ttsPreviewBtn').addEventListener('click', ttsPreview);
+document.getElementById('ttsApplyBtn').addEventListener('click', ttsApplyDefault);
+document.getElementById('ttsEngine').addEventListener('change', ttsToggleEngine);
 async function refreshV2Activity() {
   try {
     const r = await api('/api/socialV2/activity');
@@ -4462,6 +4673,7 @@ function setConsolePage(page, { updateHash = true, focus = false, target = '' } 
   closeConsoleSearch();
   // 语音库按需加载：进入二代仿真页时才探测（避免每次开控制台都压网关）。
   if (page === 'social-v2' && typeof loadVoiceLibrary === 'function') loadVoiceLibrary();
+  if (page === 'social-v2' && typeof loadTtsVoices === 'function') loadTtsVoices();
   if (focus) {
     document.getElementById('mainContent').focus({ preventScroll: true });
     document.getElementById(target || 'mainContent')?.scrollIntoView({ block: 'start', behavior: 'instant' });
