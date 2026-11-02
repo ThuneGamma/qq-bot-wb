@@ -7,7 +7,8 @@
 > 风险自负，请勿用于商业用途。本扩展只做"把 WorkBuddy CLI 变成桥接的 agent 后端"，不修改上游核心行为。
 
 > **本仓库中的裁剪说明**：以下文件只保留在本地、不随本仓库分发 —— `install.ps1`、
-> `uninstall.ps1`、`payload/scripts/setup-apply.mjs`、`payload/src/bridge.js`。
+> `uninstall.ps1`、`payload/scripts/setup-apply.mjs`、`payload/src/bridge.js`、
+> `build-bridge-patch.cjs`（最后一个的唯一输入就是 `payload/src/bridge.js`，一并移出）。
 > 原因见根目录 `README.md`：本机是在 `qq-bridge 0.2.1-r1` 上手工打补丁，没有走本包的安装器，
 > 而 `payload/src/bridge.js` 适配的是 `v0.2.0-r4`，整份覆盖会降级。
 > 仓库里的 `payload/` 因此只保留实际在用的 `wb-client.js`、脚本与文档。

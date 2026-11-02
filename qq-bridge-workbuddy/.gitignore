@@ -11,3 +11,5 @@ state/
 /uninstall.ps1
 /payload/src/bridge.js
 /payload/scripts/setup-apply.mjs
+# 构建脚本的唯一输入就是上面那个 bridge.js，一并移出
+/build-bridge-patch.cjs
