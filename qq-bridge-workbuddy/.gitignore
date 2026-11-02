@@ -4,3 +4,10 @@ node_modules/
 *.log
 state/
 .DS_Store
+
+# 本机没有走安装器（见根目录 README）：这些文件只保留在本地，不随仓库分发。
+# 需要完整安装包时从上游仓库取回。
+/install.ps1
+/uninstall.ps1
+/payload/src/bridge.js
+/payload/scripts/setup-apply.mjs
