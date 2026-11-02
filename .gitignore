@@ -1,0 +1,37 @@
+# ── 依赖 ────────────────────────────────────────────────────────────────
+node_modules/
+**/node_modules/
+
+# ── 大体积二进制与运行时（不应入代码库）────────────────────────────────
+# SnowLuma 运行时附带的 node 可执行文件（89 MB）
+SnowLuma/exe/node.exe
+# qq-bridge 的本机 ffmpeg（84 MB）
+qq-bridge/tools/*.exe
+
+# ── 本机配置：含访问令牌、QQ 号等，绝不入库 ─────────────────────────────
+SnowLuma/exe/config/
+qq-bridge/config.json
+qq-bridge/state/
+
+# ── 语音相关的大体积素材与推理环境（合计约 9 GB）───────────────────────
+qq-bridge/.gsv/
+qq-bridge/refs/
+qq-bridge/audio/
+
+# ── 运行时数据与日志 ───────────────────────────────────────────────────
+SnowLuma/exe/data/
+SnowLuma/exe/logs/
+**/state/
+*.log
+
+# ── 构建产物（源码在 packages/，可用 pnpm build:all 重建）───────────────
+**/dist/
+**/coverage/
+
+# ── 备份与临时文件 ─────────────────────────────────────────────────────
+*.bak
+*.bak-*
+**/.DS_Store
+
+# ── 本地工作记录：含真实 QQ 号、本机用户名与绝对路径，公开仓库不收录 ──
+.workbuddy/
